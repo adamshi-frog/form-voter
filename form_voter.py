@@ -50,9 +50,11 @@ def parse_form(url: str) -> dict:
                 if item[4] and isinstance(item[4], list):
                     for answer_group in item[4]:
                         if isinstance(answer_group, list) and len(answer_group) > 0:
-                            # answer_group[0] contains the entry ID and options
+                            # entry ID can be a bare int or wrapped in a list
                             if isinstance(answer_group[0], list) and len(answer_group[0]) > 0:
                                 entry_id = answer_group[0][0]
+                            elif isinstance(answer_group[0], (int, float)):
+                                entry_id = int(answer_group[0])
                             # Options are in answer_group[1]
                             if len(answer_group) > 1 and isinstance(answer_group[1], list):
                                 for opt in answer_group[1]:
