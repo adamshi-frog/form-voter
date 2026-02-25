@@ -27,6 +27,19 @@ def parse_form(url: str) -> dict:
     resp = requests.get(view_url)
     resp.raise_for_status()
 
+    # Extract hidden fields Google expects (fbzx token, etc.)
+    hidden_fields = {}
+    soup_full = BeautifulSoup(resp.text, "html.parser")
+    for inp in soup_full.find_all("input", {"type": "hidden"}):
+        name = inp.get("name")
+        val = inp.get("value", "")
+        if name:
+            hidden_fields[name] = val
+    # Also grab fbzx from the data blob if not in hidden inputs
+    fbzx_match = re.search(r'"fbzx":"([^"]+)"', resp.text)
+    if fbzx_match and "fbzx" not in hidden_fields:
+        hidden_fields["fbzx"] = fbzx_match.group(1)
+
     questions = []
     fb_match = re.search(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(.*?);\s*</script>", resp.text, re.DOTALL)
     if fb_match:
@@ -67,7 +80,11 @@ def parse_form(url: str) -> dict:
     if not questions:
         raise ValueError("Could not find any questions. Check the URL and that the form doesn't require sign-in.")
 
-    return {"submit_url": submit_url, "questions": questions}
+    # Include standard fields Google Forms expects
+    hidden_fields.setdefault("fvv", "1")
+    hidden_fields.setdefault("pageHistory", "0")
+
+    return {"submit_url": submit_url, "questions": questions, "hidden_fields": hidden_fields}
 
 
 # --- Submission verification ---
@@ -106,12 +123,14 @@ def api_test():
     data = request.json
     submit_url = data.get("submit_url")
     answers = data.get("answers", {})
+    hidden_fields = data.get("hidden_fields", {})
 
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
     try:
-        resp = requests.post(submit_url, data=answers)
+        payload = {**hidden_fields, **answers}
+        resp = requests.post(submit_url, data=payload)
         confirmed = check_confirmed(resp.text)
 
         # Extract the confirmation message text if present
@@ -136,6 +155,7 @@ def api_vote():
     data = request.json
     submit_url = data.get("submit_url")
     answers = data.get("answers", {})
+    hidden_fields = data.get("hidden_fields", {})
     count = int(data.get("count", 10))
     delay_min = float(data.get("delay_min", 1.0))
     delay_max = float(data.get("delay_max", 3.0))
@@ -143,12 +163,14 @@ def api_vote():
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
+    payload = {**hidden_fields, **answers}
+
     def generate():
         success = 0
         failed = 0
         for i in range(1, count + 1):
             try:
-                resp = requests.post(submit_url, data=answers)
+                resp = requests.post(submit_url, data=payload)
                 confirmed = check_confirmed(resp.text)
                 if resp.status_code == 200 and confirmed:
                     success += 1
@@ -342,7 +364,7 @@ async function testVote() {
     const res = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ submit_url: formData.submit_url, answers })
+      body: JSON.stringify({ submit_url: formData.submit_url, answers, hidden_fields: formData.hidden_fields || {} })
     });
     const d = await res.json();
     if (d.error) {
@@ -380,8 +402,8 @@ function startVoting() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       submit_url: formData.submit_url,
-      answers, count,
-      delay_min: delayMin, delay_max: delayMax
+      answers, hidden_fields: formData.hidden_fields || {},
+      count, delay_min: delayMin, delay_max: delayMax
     })
   }).then(res => {
     const reader = res.body.getReader();
