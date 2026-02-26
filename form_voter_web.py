@@ -6,6 +6,8 @@ import re
 import random
 import time
 import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, render_template_string, request, jsonify, Response
 import requests
@@ -88,15 +90,17 @@ def test_proxy(proxy: str, submit_url: str = None, payload: dict = None, timeout
         return False
 
 
-def submit_vote(submit_url: str, answers: dict, hidden_fields: dict, proxy: str = None):
+def submit_vote(submit_url: str, answers: dict, hidden_fields: dict, proxy: str = None, rotating_overrides: dict = None):
     """Direct POST to the form submission endpoint — no extra GET."""
     proxies = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
-    payload = {**hidden_fields, **answers}
+    merged = {**hidden_fields, **answers}
+    if rotating_overrides:
+        merged.update(rotating_overrides)
     return requests.post(
         submit_url,
-        data=payload,
+        data=merged,
         headers=random_headers(),
         proxies=proxies,
         timeout=15,
@@ -252,13 +256,16 @@ def api_test():
     answers = data.get("answers", {})
     hidden_fields = data.get("hidden_fields", {})
     proxies = data.get("proxies", [])
+    rotating_answers = data.get("rotating_answers", {})
 
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
     try:
         proxy = random.choice(proxies) if proxies else None
-        resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy)
+        # For test, use first value from each rotating field
+        overrides = {eid: vals[0] for eid, vals in rotating_answers.items() if vals}
+        resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy, rotating_overrides=overrides)
         confirmed = check_confirmed(resp.text)
 
         confirm_msg = None
@@ -267,11 +274,12 @@ def api_test():
         if el:
             confirm_msg = el.get_text(strip=True)
 
+        test_answers = {**answers, **overrides}
         return jsonify({
             "http_status": resp.status_code,
             "confirmed": confirmed,
             "confirm_message": confirm_msg,
-            "payload_sent": answers,
+            "payload_sent": test_answers,
             "proxy_used": proxy,
         })
     except requests.RequestException as e:
@@ -286,41 +294,60 @@ def api_vote():
     hidden_fields = data.get("hidden_fields", {})
     proxies = data.get("proxies", [])
     count = int(data.get("count", 10))
-    delay_min = float(data.get("delay_min", 1.0))
-    delay_max = float(data.get("delay_max", 3.0))
+    threads = int(data.get("threads", 10))
+    delay_min = float(data.get("delay_min", 0.5))
+    delay_max = float(data.get("delay_max", 2.0))
 
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
+    result_queue = queue.Queue()
+
+    def worker(vote_num):
+        """Submit a single vote, put result in the queue."""
+        time.sleep(random.uniform(0, delay_max))
+        try:
+            proxy = random.choice(proxies) if proxies else None
+            resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy)
+            confirmed = check_confirmed(resp.text)
+            sorry = "google.com/sorry" in getattr(resp, "url", "")
+
+            if resp.status_code == 200 and confirmed:
+                result_queue.put({"i": vote_num, "status": "ok", "proxy": proxy})
+            elif resp.status_code == 429 or sorry or (resp.status_code == 200 and not confirmed):
+                result_queue.put({"i": vote_num, "status": "rate_limited", "proxy": proxy})
+            else:
+                result_queue.put({"i": vote_num, "status": "fail", "code": resp.status_code})
+        except Exception as e:
+            result_queue.put({"i": vote_num, "status": "error", "message": str(e)})
+
     def generate():
         success = 0
         failed = 0
-        backoff = 0
-        for i in range(1, count + 1):
-            try:
-                proxy = random.choice(proxies) if proxies else None
-                resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy)
-                confirmed = check_confirmed(resp.text)
-                if resp.status_code == 200 and confirmed:
+        completed = 0
+        max_workers = max(1, min(threads, count))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i in range(1, count + 1):
+                executor.submit(worker, i)
+
+            while completed < count:
+                try:
+                    result = result_queue.get(timeout=30)
+                except queue.Empty:
+                    continue
+
+                completed += 1
+                if result["status"] == "ok":
                     success += 1
-                    backoff = max(0, backoff - 1)
-                    yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'ok', 'success': success, 'failed': failed})}\n\n"
-                elif resp.status_code == 429 or (resp.status_code == 200 and not confirmed):
-                    failed += 1
-                    backoff = min(backoff + 3, 30)
-                    status = 'rate_limited' if resp.status_code == 429 else 'rejected'
-                    yield f"data: {json.dumps({'i': i, 'total': count, 'status': status, 'success': success, 'failed': failed, 'backoff': backoff})}\n\n"
                 else:
                     failed += 1
-                    yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'fail', 'code': resp.status_code, 'success': success, 'failed': failed})}\n\n"
-            except requests.RequestException as e:
-                failed += 1
-                backoff = min(backoff + 2, 30)
-                yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'error', 'message': str(e), 'success': success, 'failed': failed})}\n\n"
 
-            if i < count:
-                delay = random.uniform(delay_min, delay_max) + backoff
-                time.sleep(delay)
+                result["total"] = count
+                result["success"] = success
+                result["failed"] = failed
+                result["completed"] = completed
+                yield f"data: {json.dumps(result)}\n\n"
 
         yield f"data: {json.dumps({'done': True, 'success': success, 'failed': failed, 'total': count})}\n\n"
 
@@ -380,6 +407,10 @@ HTML = """
   .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #555; border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 8px; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
   #questions-section, #vote-section, #status { display: none; }
+  .rotate-toggle { display: inline-block; font-size: 11px; padding: 3px 8px; border-radius: 4px; background: #2a2a2a; color: #888; border: none; cursor: pointer; margin-left: 8px; vertical-align: middle; }
+  .rotate-toggle.active { background: #3b82f6; color: #fff; }
+  .rotate-toggle:hover { opacity: 0.85; }
+  .rotate-hint { font-size: 11px; color: #555; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -408,15 +439,15 @@ HTML = """
     <div class="row">
       <div class="field">
         <label>Votes</label>
-        <input type="number" id="count" value="10" min="1" max="10000">
+        <input type="number" id="count" value="100" min="1" max="100000">
       </div>
       <div class="field">
-        <label>Min Delay (s)</label>
-        <input type="number" id="delay-min" value="3" min="0" step="0.5">
+        <label>Threads</label>
+        <input type="number" id="threads" value="10" min="1" max="50">
       </div>
       <div class="field">
-        <label>Max Delay (s)</label>
-        <input type="number" id="delay-max" value="6" min="0" step="0.5">
+        <label>Max Stagger (s)</label>
+        <input type="number" id="delay-max" value="2" min="0" step="0.5">
       </div>
     </div>
     <div class="btn-row">
@@ -529,16 +560,31 @@ function renderQuestions(questions) {
   section.style.display = 'block';
   section.innerHTML = questions.map((q, qi) => `
     <div class="question">
-      <h3>${q.title}</h3>
+      <h3>${q.title}${!q.options.length ? `<button class="rotate-toggle" data-qi="${qi}" onclick="toggleRotate(${qi})">Rotate</button>` : ''}</h3>
       ${q.options.length ? q.options.map((opt, oi) => `
         <label class="option">
           <input type="radio" name="q${qi}" value="${oi}">
           ${opt}
         </label>
-      `).join('') : `<input type="text" class="freetext" data-qi="${qi}" placeholder="Type your answer">`}
+      `).join('') : `
+        <div id="single-${qi}"><input type="text" class="freetext" data-qi="${qi}" placeholder="Type your answer"></div>
+        <div id="rotate-${qi}" style="display:none">
+          <textarea class="rotate-values" data-qi="${qi}" placeholder="One identity per line&#10;e.g. Alice&#10;Bob&#10;Charlie"></textarea>
+          <div class="rotate-hint">Each submission cycles through these values in order.</div>
+        </div>
+      `}
     </div>
   `).join('');
   document.getElementById('vote-section').style.display = 'block';
+}
+
+function toggleRotate(qi) {
+  const btn = document.querySelector(`.rotate-toggle[data-qi="${qi}"]`);
+  const single = document.getElementById('single-' + qi);
+  const rotate = document.getElementById('rotate-' + qi);
+  const isActive = btn.classList.toggle('active');
+  single.style.display = isActive ? 'none' : 'block';
+  rotate.style.display = isActive ? 'block' : 'none';
 }
 
 function getAnswers() {
@@ -548,11 +594,29 @@ function getAnswers() {
       const checked = document.querySelector(`input[name="q${qi}"]:checked`);
       if (checked) answers[q.entry_id] = q.options[parseInt(checked.value)];
     } else {
-      const input = document.querySelector(`.freetext[data-qi="${qi}"]`);
-      if (input && input.value.trim()) answers[q.entry_id] = input.value.trim();
+      const btn = document.querySelector(`.rotate-toggle[data-qi="${qi}"]`);
+      const isRotating = btn && btn.classList.contains('active');
+      if (!isRotating) {
+        const input = document.querySelector(`.freetext[data-qi="${qi}"]`);
+        if (input && input.value.trim()) answers[q.entry_id] = input.value.trim();
+      }
     }
   });
   return answers;
+}
+
+function getRotatingAnswers() {
+  const rotating = {};
+  formData.questions.forEach((q, qi) => {
+    if (q.options.length) return;
+    const btn = document.querySelector(`.rotate-toggle[data-qi="${qi}"]`);
+    if (!btn || !btn.classList.contains('active')) return;
+    const ta = document.querySelector(`.rotate-values[data-qi="${qi}"]`);
+    if (!ta) return;
+    const vals = ta.value.split('\\n').map(v => v.trim()).filter(v => v.length > 0);
+    if (vals.length > 0) rotating[q.entry_id] = vals;
+  });
+  return rotating;
 }
 
 function getProxies() {
@@ -575,7 +639,7 @@ async function testVote() {
     const res = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ submit_url: formData.submit_url, answers, hidden_fields: formData.hidden_fields || {}, proxies: getProxies() })
+      body: JSON.stringify({ submit_url: formData.submit_url, answers, hidden_fields: formData.hidden_fields || {}, proxies: getProxies(), rotating_answers: getRotatingAnswers() })
     });
     const d = await res.json();
     if (d.error) {
@@ -597,9 +661,9 @@ function startVoting() {
   const answers = getAnswers();
   if (Object.keys(answers).length === 0) { alert('Select an answer first.'); return; }
 
-  const count = parseInt(document.getElementById('count').value) || 10;
-  const delayMin = parseFloat(document.getElementById('delay-min').value) || 1;
-  const delayMax = parseFloat(document.getElementById('delay-max').value) || 3;
+  const count = parseInt(document.getElementById('count').value) || 100;
+  const threads = parseInt(document.getElementById('threads').value) || 10;
+  const delayMax = parseFloat(document.getElementById('delay-max').value) || 2;
 
   document.getElementById('vote-btn').disabled = true;
   document.getElementById('test-btn').disabled = true;
@@ -615,7 +679,7 @@ function startVoting() {
       submit_url: formData.submit_url,
       answers, hidden_fields: formData.hidden_fields || {},
       proxies: getProxies(),
-      count, delay_min: delayMin, delay_max: delayMax
+      count, threads, delay_min: 0, delay_max: delayMax
     })
   }).then(res => {
     const reader = res.body.getReader();
@@ -636,16 +700,16 @@ function startVoting() {
             document.getElementById('vote-btn').disabled = false;
             document.getElementById('test-btn').disabled = false;
           } else {
-            const pct = (d.i / d.total * 100).toFixed(1);
+            const pct = (d.completed / d.total * 100).toFixed(1);
             fill.style.width = pct + '%';
             let cls = 'fail';
             let msg = 'Failed';
             if (d.status === 'ok') { cls = 'ok'; msg = 'Confirmed'; }
-            else if (d.status === 'rate_limited') { cls = 'rejected'; msg = `Rate limited — backing off +${d.backoff}s`; }
-            else if (d.status === 'rejected') { cls = 'rejected'; msg = 'Rejected (not counted)'; }
+            else if (d.status === 'rate_limited') { cls = 'rejected'; msg = 'Rate limited'; }
             else if (d.code) { msg = 'HTTP ' + d.code; }
             else if (d.message) { msg = d.message; }
-            log.innerHTML += `<div class="${cls}">[${d.i}/${d.total}] ${msg}</div>`;
+            const proxyTag = d.proxy ? ` via ${d.proxy.replace('http://', '')}` : '';
+            log.innerHTML += `<div class="${cls}">[${d.completed}/${d.total}] #${d.i} ${msg}${proxyTag}</div>`;
           }
           log.scrollTop = log.scrollHeight;
         });
