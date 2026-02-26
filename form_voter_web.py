@@ -64,51 +64,33 @@ def fetch_free_proxies() -> list:
 
 
 def test_proxy(proxy: str, timeout: float = 5) -> bool:
-    """Quick check if a proxy can reach Google."""
+    """Quick check if a proxy can reach Google Forms submission endpoint."""
     try:
-        resp = requests.get(
-            "https://docs.google.com/forms",
+        resp = requests.head(
+            "https://docs.google.com",
             proxies={"http": proxy, "https": proxy},
             headers=random_headers(),
             timeout=timeout,
+            allow_redirects=True,
         )
-        return resp.status_code == 200
+        return resp.status_code < 400
     except Exception:
         return False
 
 
-def submit_with_session(view_url: str, submit_url: str, answers: dict, proxy: str = None):
-    """Mimic a real browser: create a fresh session, visit the form, then submit."""
-    session = requests.Session()
-    session.headers.update(random_headers())
-
+def submit_vote(submit_url: str, answers: dict, hidden_fields: dict, proxy: str = None):
+    """Direct POST to the form submission endpoint — no extra GET."""
     proxies = None
     if proxy:
         proxies = {"http": proxy, "https": proxy}
-
-    # Step 1: GET the form page (gets Google cookies + fresh fbzx token)
-    page = session.get(view_url, proxies=proxies, timeout=15)
-    page.raise_for_status()
-
-    # Extract fresh hidden fields from this session's page
-    fresh_hidden = {}
-    soup = BeautifulSoup(page.text, "html.parser")
-    for inp in soup.find_all("input", {"type": "hidden"}):
-        name = inp.get("name")
-        val = inp.get("value", "")
-        if name:
-            fresh_hidden[name] = val
-    fbzx_match = re.search(r'"fbzx":"([^"]+)"', page.text)
-    if fbzx_match:
-        fresh_hidden["fbzx"] = fbzx_match.group(1)
-    fresh_hidden.setdefault("fvv", "1")
-    fresh_hidden.setdefault("pageHistory", "0")
-
-    # Step 2: POST with session cookies + fresh tokens
-    payload = {**fresh_hidden, **answers}
-    resp = session.post(submit_url, data=payload, proxies=proxies, timeout=15)
-    session.close()
-    return resp
+    payload = {**hidden_fields, **answers}
+    return requests.post(
+        submit_url,
+        data=payload,
+        headers=random_headers(),
+        proxies=proxies,
+        timeout=15,
+    )
 
 # --- Reuse parsing logic from form_voter.py ---
 
@@ -247,11 +229,11 @@ def api_parse():
 
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    """Submit a single vote via full browser session and return verification."""
+    """Submit a single vote via direct POST and return verification."""
     data = request.json
     submit_url = data.get("submit_url")
-    view_url = submit_url.replace("/formResponse", "/viewform") if submit_url else None
     answers = data.get("answers", {})
+    hidden_fields = data.get("hidden_fields", {})
     proxies = data.get("proxies", [])
 
     if not submit_url or not answers:
@@ -259,7 +241,7 @@ def api_test():
 
     try:
         proxy = random.choice(proxies) if proxies else None
-        resp = submit_with_session(view_url, submit_url, answers, proxy=proxy)
+        resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy)
         confirmed = check_confirmed(resp.text)
 
         confirm_msg = None
@@ -283,8 +265,8 @@ def api_test():
 def api_vote():
     data = request.json
     submit_url = data.get("submit_url")
-    view_url = submit_url.replace("/formResponse", "/viewform") if submit_url else None
     answers = data.get("answers", {})
+    hidden_fields = data.get("hidden_fields", {})
     proxies = data.get("proxies", [])
     count = int(data.get("count", 10))
     delay_min = float(data.get("delay_min", 1.0))
@@ -300,7 +282,7 @@ def api_vote():
         for i in range(1, count + 1):
             try:
                 proxy = random.choice(proxies) if proxies else None
-                resp = submit_with_session(view_url, submit_url, answers, proxy=proxy)
+                resp = submit_vote(submit_url, answers, hidden_fields, proxy=proxy)
                 confirmed = check_confirmed(resp.text)
                 if resp.status_code == 200 and confirmed:
                     success += 1
@@ -565,7 +547,7 @@ async function testVote() {
     const res = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ submit_url: formData.submit_url, answers, proxies: getProxies() })
+      body: JSON.stringify({ submit_url: formData.submit_url, answers, hidden_fields: formData.hidden_fields || {}, proxies: getProxies() })
     });
     const d = await res.json();
     if (d.error) {
@@ -603,7 +585,8 @@ function startVoting() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       submit_url: formData.submit_url,
-      answers, proxies: getProxies(),
+      answers, hidden_fields: formData.hidden_fields || {},
+      proxies: getProxies(),
       count, delay_min: delayMin, delay_max: delayMax
     })
   }).then(res => {
