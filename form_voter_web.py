@@ -13,6 +13,29 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+]
+
+def random_headers():
+    """Generate randomized browser-like headers for each request."""
+    ua = random.choice(USER_AGENTS)
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.9", "en-US,en;q=0.5"]),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://docs.google.com/",
+    }
+
 # --- Reuse parsing logic from form_voter.py ---
 
 def parse_form(url: str) -> dict:
@@ -133,7 +156,7 @@ def api_test():
 
     try:
         payload = {**hidden_fields, **answers}
-        resp = requests.post(submit_url, data=payload)
+        resp = requests.post(submit_url, data=payload, headers=random_headers())
         confirmed = check_confirmed(resp.text)
 
         # Extract the confirmation message text if present
@@ -171,25 +194,31 @@ def api_vote():
     def generate():
         success = 0
         failed = 0
+        backoff = 0  # extra delay added when rate limited
         for i in range(1, count + 1):
             try:
-                resp = requests.post(submit_url, data=payload)
+                resp = requests.post(submit_url, data=payload, headers=random_headers())
                 confirmed = check_confirmed(resp.text)
                 if resp.status_code == 200 and confirmed:
                     success += 1
+                    backoff = max(0, backoff - 1)  # ease off backoff on success
                     yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'ok', 'success': success, 'failed': failed})}\n\n"
-                elif resp.status_code == 200 and not confirmed:
+                elif resp.status_code == 429 or (resp.status_code == 200 and not confirmed):
                     failed += 1
-                    yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'rejected', 'success': success, 'failed': failed, 'detail': 'HTTP 200 but no confirmation — vote likely not counted'})}\n\n"
+                    backoff = min(backoff + 3, 30)  # increase backoff, cap at 30s
+                    status = 'rate_limited' if resp.status_code == 429 else 'rejected'
+                    yield f"data: {json.dumps({'i': i, 'total': count, 'status': status, 'success': success, 'failed': failed, 'backoff': backoff})}\n\n"
                 else:
                     failed += 1
                     yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'fail', 'code': resp.status_code, 'success': success, 'failed': failed})}\n\n"
             except requests.RequestException as e:
                 failed += 1
+                backoff = min(backoff + 2, 30)
                 yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'error', 'message': str(e), 'success': success, 'failed': failed})}\n\n"
 
             if i < count:
-                time.sleep(random.uniform(delay_min, delay_max))
+                delay = random.uniform(delay_min, delay_max) + backoff
+                time.sleep(delay)
 
         yield f"data: {json.dumps({'done': True, 'success': success, 'failed': failed, 'total': count})}\n\n"
 
@@ -432,6 +461,7 @@ function startVoting() {
             let cls = 'fail';
             let msg = 'Failed';
             if (d.status === 'ok') { cls = 'ok'; msg = 'Confirmed'; }
+            else if (d.status === 'rate_limited') { cls = 'rejected'; msg = `Rate limited — backing off +${d.backoff}s`; }
             else if (d.status === 'rejected') { cls = 'rejected'; msg = 'Rejected (not counted)'; }
             else if (d.code) { msg = 'HTTP ' + d.code; }
             else if (d.message) { msg = d.message; }
