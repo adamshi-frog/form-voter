@@ -63,17 +63,27 @@ def fetch_free_proxies() -> list:
     return all_proxies
 
 
-def test_proxy(proxy: str, timeout: float = 5) -> bool:
-    """Quick check if a proxy can reach Google Forms submission endpoint."""
+def test_proxy(proxy: str, submit_url: str = None, payload: dict = None, timeout: float = 6) -> bool:
+    """Test if a proxy can actually submit a vote (not just reach Google)."""
     try:
-        resp = requests.head(
-            "https://docs.google.com",
-            proxies={"http": proxy, "https": proxy},
-            headers=random_headers(),
-            timeout=timeout,
-            allow_redirects=True,
-        )
-        return resp.status_code < 400
+        if submit_url and payload:
+            resp = requests.post(
+                submit_url,
+                data=payload,
+                proxies={"http": proxy, "https": proxy},
+                headers=random_headers(),
+                timeout=timeout,
+            )
+            return "Your response has been recorded" in resp.text or "freebirdFormviewerViewResponseConfirmationMessage" in resp.text
+        else:
+            resp = requests.head(
+                "https://docs.google.com",
+                proxies={"http": proxy, "https": proxy},
+                headers=random_headers(),
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            return resp.status_code < 400
     except Exception:
         return False
 
@@ -189,8 +199,16 @@ def check_confirmed(html: str) -> bool:
 
 @app.route("/api/proxies", methods=["POST"])
 def api_proxies():
-    """Fetch free proxies and test them, streaming results."""
+    """Fetch free proxies and test them against the actual form."""
     max_working = int(request.json.get("max", 20))
+    submit_url = request.json.get("submit_url")
+    answers = request.json.get("answers", {})
+    hidden_fields = request.json.get("hidden_fields", {})
+
+    # Build a real test payload if form data is available
+    test_payload = None
+    if submit_url and answers:
+        test_payload = {**hidden_fields, **answers}
 
     def generate():
         yield f"data: {json.dumps({'status': 'fetching'})}\n\n"
@@ -203,10 +221,9 @@ def api_proxies():
             if len(working) >= max_working:
                 break
             tested += 1
-            if test_proxy(proxy, timeout=4):
+            if test_proxy(proxy, submit_url=submit_url, payload=test_payload, timeout=6):
                 working.append(proxy)
                 yield f"data: {json.dumps({'status': 'found', 'proxy': proxy, 'working': len(working), 'tested': tested})}\n\n"
-            # Progress update every 10 tested
             elif tested % 10 == 0:
                 yield f"data: {json.dumps({'status': 'progress', 'tested': tested, 'working': len(working)})}\n\n"
 
@@ -424,13 +441,23 @@ async function fetchProxies() {
   const textarea = document.getElementById('proxies');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Fetching & testing...';
-  hint.textContent = 'Fetching proxy lists...';
+
+  // If form is loaded, test proxies against the actual form (not just connectivity)
+  const reqBody = {max: 20};
+  if (formData) {
+    reqBody.submit_url = formData.submit_url;
+    reqBody.answers = getAnswers();
+    reqBody.hidden_fields = formData.hidden_fields || {};
+    hint.textContent = 'Fetching proxies & testing against form...';
+  } else {
+    hint.textContent = 'Fetching proxies (load form first for deeper test)...';
+  }
 
   try {
     const res = await fetch('/api/proxies', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({max: 20})
+      body: JSON.stringify(reqBody)
     });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
