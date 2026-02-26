@@ -37,6 +37,46 @@ def random_headers():
     }
 
 
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=&ssl=all&anonymity=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+]
+
+
+def fetch_free_proxies() -> list:
+    """Fetch free HTTP proxies from public sources."""
+    all_proxies = []
+    for src in PROXY_SOURCES:
+        try:
+            resp = requests.get(src, timeout=10)
+            if resp.status_code == 200:
+                for line in resp.text.strip().splitlines():
+                    line = line.strip()
+                    if line and ":" in line:
+                        all_proxies.append(f"http://{line}")
+        except Exception:
+            continue
+    # Deduplicate and shuffle
+    all_proxies = list(set(all_proxies))
+    random.shuffle(all_proxies)
+    return all_proxies
+
+
+def test_proxy(proxy: str, timeout: float = 5) -> bool:
+    """Quick check if a proxy can reach Google."""
+    try:
+        resp = requests.get(
+            "https://docs.google.com/forms",
+            proxies={"http": proxy, "https": proxy},
+            headers=random_headers(),
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def submit_with_session(view_url: str, submit_url: str, answers: dict, proxy: str = None):
     """Mimic a real browser: create a fresh session, visit the form, then submit."""
     session = requests.Session()
@@ -164,6 +204,34 @@ def check_confirmed(html: str) -> bool:
 
 
 # --- API routes ---
+
+@app.route("/api/proxies", methods=["POST"])
+def api_proxies():
+    """Fetch free proxies and test them, streaming results."""
+    max_working = int(request.json.get("max", 20))
+
+    def generate():
+        yield f"data: {json.dumps({'status': 'fetching'})}\n\n"
+        raw = fetch_free_proxies()
+        yield f"data: {json.dumps({'status': 'testing', 'total_fetched': len(raw)})}\n\n"
+
+        working = []
+        tested = 0
+        for proxy in raw:
+            if len(working) >= max_working:
+                break
+            tested += 1
+            if test_proxy(proxy, timeout=4):
+                working.append(proxy)
+                yield f"data: {json.dumps({'status': 'found', 'proxy': proxy, 'working': len(working), 'tested': tested})}\n\n"
+            # Progress update every 10 tested
+            elif tested % 10 == 0:
+                yield f"data: {json.dumps({'status': 'progress', 'tested': tested, 'working': len(working)})}\n\n"
+
+        yield f"data: {json.dumps({'done': True, 'working': working, 'total_tested': tested})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
+
 
 @app.route("/api/parse", methods=["POST"])
 def api_parse():
@@ -346,9 +414,10 @@ HTML = """
       </div>
     </div>
     <div class="field">
-      <label>Proxies (optional)</label>
+      <label>Proxies</label>
       <textarea id="proxies" placeholder="http://ip:port&#10;http://user:pass@ip:port&#10;socks5://ip:port"></textarea>
-      <div class="hint">One per line. Rotates randomly. Without proxies, all requests come from your IP.</div>
+      <div class="hint" id="proxy-hint">One per line. Rotates randomly. Without proxies, all requests come from your IP.</div>
+      <button class="btn-secondary" style="margin-top:8px" id="fetch-proxies-btn" onclick="fetchProxies()">Fetch Free Proxies</button>
     </div>
     <div class="btn-row">
       <button class="btn-secondary" id="test-btn" onclick="testVote()">Test 1 Vote</button>
@@ -365,6 +434,57 @@ HTML = """
 
 <script>
 let formData = null;
+
+async function fetchProxies() {
+  const btn = document.getElementById('fetch-proxies-btn');
+  const hint = document.getElementById('proxy-hint');
+  const textarea = document.getElementById('proxies');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Fetching & testing...';
+  hint.textContent = 'Fetching proxy lists...';
+
+  try {
+    const res = await fetch('/api/proxies', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({max: 20})
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    function read() {
+      return reader.read().then(({done, value}) => {
+        if (done) return;
+        buffer += decoder.decode(value, {stream: true});
+        const lines = buffer.split('\\n');
+        buffer = lines.pop();
+        lines.forEach(line => {
+          if (!line.startsWith('data: ')) return;
+          const d = JSON.parse(line.slice(6));
+          if (d.status === 'testing') {
+            hint.textContent = `Testing ${d.total_fetched} proxies...`;
+          } else if (d.status === 'found') {
+            textarea.value += (textarea.value ? '\\n' : '') + d.proxy;
+            hint.textContent = `Found ${d.working} working (tested ${d.tested})...`;
+          } else if (d.status === 'progress') {
+            hint.textContent = `Found ${d.working} working (tested ${d.tested})...`;
+          } else if (d.done) {
+            hint.textContent = `Done: ${d.working.length} working proxies from ${d.total_tested} tested.`;
+            btn.disabled = false;
+            btn.textContent = 'Fetch Free Proxies';
+          }
+        });
+        return read();
+      });
+    }
+    await read();
+  } catch (e) {
+    hint.textContent = 'Error fetching proxies: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = 'Fetch Free Proxies';
+  }
+}
 
 async function fetchForm() {
   const url = document.getElementById('url').value.trim();
