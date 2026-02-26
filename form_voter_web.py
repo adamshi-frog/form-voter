@@ -36,6 +36,40 @@ def random_headers():
         "Referer": "https://docs.google.com/",
     }
 
+
+def submit_with_session(view_url: str, submit_url: str, answers: dict, proxy: str = None):
+    """Mimic a real browser: create a fresh session, visit the form, then submit."""
+    session = requests.Session()
+    session.headers.update(random_headers())
+
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+
+    # Step 1: GET the form page (gets Google cookies + fresh fbzx token)
+    page = session.get(view_url, proxies=proxies, timeout=15)
+    page.raise_for_status()
+
+    # Extract fresh hidden fields from this session's page
+    fresh_hidden = {}
+    soup = BeautifulSoup(page.text, "html.parser")
+    for inp in soup.find_all("input", {"type": "hidden"}):
+        name = inp.get("name")
+        val = inp.get("value", "")
+        if name:
+            fresh_hidden[name] = val
+    fbzx_match = re.search(r'"fbzx":"([^"]+)"', page.text)
+    if fbzx_match:
+        fresh_hidden["fbzx"] = fbzx_match.group(1)
+    fresh_hidden.setdefault("fvv", "1")
+    fresh_hidden.setdefault("pageHistory", "0")
+
+    # Step 2: POST with session cookies + fresh tokens
+    payload = {**fresh_hidden, **answers}
+    resp = session.post(submit_url, data=payload, proxies=proxies, timeout=15)
+    session.close()
+    return resp
+
 # --- Reuse parsing logic from form_voter.py ---
 
 def parse_form(url: str) -> dict:
@@ -145,21 +179,21 @@ def api_parse():
 
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    """Submit a single vote and return detailed verification info."""
+    """Submit a single vote via full browser session and return verification."""
     data = request.json
     submit_url = data.get("submit_url")
+    view_url = submit_url.replace("/formResponse", "/viewform") if submit_url else None
     answers = data.get("answers", {})
-    hidden_fields = data.get("hidden_fields", {})
+    proxies = data.get("proxies", [])
 
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
     try:
-        payload = {**hidden_fields, **answers}
-        resp = requests.post(submit_url, data=payload, headers=random_headers())
+        proxy = random.choice(proxies) if proxies else None
+        resp = submit_with_session(view_url, submit_url, answers, proxy=proxy)
         confirmed = check_confirmed(resp.text)
 
-        # Extract the confirmation message text if present
         confirm_msg = None
         soup = BeautifulSoup(resp.text, "html.parser")
         el = soup.find(class_="freebirdFormviewerViewResponseConfirmationMessage")
@@ -171,6 +205,7 @@ def api_test():
             "confirmed": confirmed,
             "confirm_message": confirm_msg,
             "payload_sent": answers,
+            "proxy_used": proxy,
         })
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 500
@@ -180,8 +215,9 @@ def api_test():
 def api_vote():
     data = request.json
     submit_url = data.get("submit_url")
+    view_url = submit_url.replace("/formResponse", "/viewform") if submit_url else None
     answers = data.get("answers", {})
-    hidden_fields = data.get("hidden_fields", {})
+    proxies = data.get("proxies", [])
     count = int(data.get("count", 10))
     delay_min = float(data.get("delay_min", 1.0))
     delay_max = float(data.get("delay_max", 3.0))
@@ -189,23 +225,22 @@ def api_vote():
     if not submit_url or not answers:
         return jsonify({"error": "Missing submit_url or answers"}), 400
 
-    payload = {**hidden_fields, **answers}
-
     def generate():
         success = 0
         failed = 0
-        backoff = 0  # extra delay added when rate limited
+        backoff = 0
         for i in range(1, count + 1):
             try:
-                resp = requests.post(submit_url, data=payload, headers=random_headers())
+                proxy = random.choice(proxies) if proxies else None
+                resp = submit_with_session(view_url, submit_url, answers, proxy=proxy)
                 confirmed = check_confirmed(resp.text)
                 if resp.status_code == 200 and confirmed:
                     success += 1
-                    backoff = max(0, backoff - 1)  # ease off backoff on success
+                    backoff = max(0, backoff - 1)
                     yield f"data: {json.dumps({'i': i, 'total': count, 'status': 'ok', 'success': success, 'failed': failed})}\n\n"
                 elif resp.status_code == 429 or (resp.status_code == 200 and not confirmed):
                     failed += 1
-                    backoff = min(backoff + 3, 30)  # increase backoff, cap at 30s
+                    backoff = min(backoff + 3, 30)
                     status = 'rate_limited' if resp.status_code == 429 else 'rejected'
                     yield f"data: {json.dumps({'i': i, 'total': count, 'status': status, 'success': success, 'failed': failed, 'backoff': backoff})}\n\n"
                 else:
@@ -269,6 +304,9 @@ HTML = """
   .btn-row { display: flex; gap: 10px; }
   .btn-secondary { background: #2a2a2a; color: #e0e0e0; }
   .btn-secondary:hover:not(:disabled) { background: #333; }
+  textarea { width: 100%; padding: 10px 12px; background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; color: #e0e0e0; font-size: 13px; font-family: 'SF Mono', Monaco, monospace; outline: none; resize: vertical; min-height: 60px; transition: border-color 0.2s; }
+  textarea:focus { border-color: #555; }
+  .hint { font-size: 12px; color: #555; margin-top: 4px; }
   .progress-bar { height: 4px; background: #2a2a2a; border-radius: 2px; margin-bottom: 12px; overflow: hidden; }
   .progress-bar .fill { height: 100%; background: #fff; transition: width 0.3s; width: 0%; }
   .error { color: #ef4444; font-size: 14px; margin-top: 8px; }
@@ -300,12 +338,17 @@ HTML = """
       </div>
       <div class="field">
         <label>Min Delay (s)</label>
-        <input type="number" id="delay-min" value="1" min="0" step="0.5">
+        <input type="number" id="delay-min" value="3" min="0" step="0.5">
       </div>
       <div class="field">
         <label>Max Delay (s)</label>
-        <input type="number" id="delay-max" value="3" min="0" step="0.5">
+        <input type="number" id="delay-max" value="6" min="0" step="0.5">
       </div>
+    </div>
+    <div class="field">
+      <label>Proxies (optional)</label>
+      <textarea id="proxies" placeholder="http://ip:port&#10;http://user:pass@ip:port&#10;socks5://ip:port"></textarea>
+      <div class="hint">One per line. Rotates randomly. Without proxies, all requests come from your IP.</div>
     </div>
     <div class="btn-row">
       <button class="btn-secondary" id="test-btn" onclick="testVote()">Test 1 Vote</button>
@@ -382,6 +425,12 @@ function getAnswers() {
   return answers;
 }
 
+function getProxies() {
+  const raw = document.getElementById('proxies').value.trim();
+  if (!raw) return [];
+  return raw.split('\\n').map(p => p.trim()).filter(p => p.length > 0);
+}
+
 async function testVote() {
   const answers = getAnswers();
   if (Object.keys(answers).length === 0) { alert('Select an answer first.'); return; }
@@ -396,7 +445,7 @@ async function testVote() {
     const res = await fetch('/api/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ submit_url: formData.submit_url, answers, hidden_fields: formData.hidden_fields || {} })
+      body: JSON.stringify({ submit_url: formData.submit_url, answers, proxies: getProxies() })
     });
     const d = await res.json();
     if (d.error) {
@@ -434,7 +483,7 @@ function startVoting() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       submit_url: formData.submit_url,
-      answers, hidden_fields: formData.hidden_fields || {},
+      answers, proxies: getProxies(),
       count, delay_min: delayMin, delay_max: delayMax
     })
   }).then(res => {
