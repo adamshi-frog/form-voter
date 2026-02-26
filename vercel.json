@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "form_voter_web.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "form_voter_web.py"
+    }
+  ]
+}
