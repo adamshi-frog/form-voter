@@ -378,6 +378,13 @@ HTML = """
     <div id="fetch-error" class="error"></div>
   </div>
 
+  <div class="field">
+    <label>Proxies</label>
+    <textarea id="proxies" placeholder="http://ip:port&#10;http://user:pass@ip:port&#10;socks5://ip:port"></textarea>
+    <div class="hint" id="proxy-hint">One per line. Rotates randomly. Without proxies, all requests come from your IP.</div>
+    <button class="btn-secondary" style="margin-top:8px" id="fetch-proxies-btn" onclick="fetchProxies()">Fetch Free Proxies</button>
+  </div>
+
   <div id="questions-section"></div>
 
   <div id="vote-section">
@@ -394,12 +401,6 @@ HTML = """
         <label>Max Delay (s)</label>
         <input type="number" id="delay-max" value="6" min="0" step="0.5">
       </div>
-    </div>
-    <div class="field">
-      <label>Proxies</label>
-      <textarea id="proxies" placeholder="http://ip:port&#10;http://user:pass@ip:port&#10;socks5://ip:port"></textarea>
-      <div class="hint" id="proxy-hint">One per line. Rotates randomly. Without proxies, all requests come from your IP.</div>
-      <button class="btn-secondary" style="margin-top:8px" id="fetch-proxies-btn" onclick="fetchProxies()">Fetch Free Proxies</button>
     </div>
     <div class="btn-row">
       <button class="btn-secondary" id="test-btn" onclick="testVote()">Test 1 Vote</button>
